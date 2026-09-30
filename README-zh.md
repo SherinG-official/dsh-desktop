@@ -1,6 +1,6 @@
 # dsh-desktop-pet
 
-DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 token 用量与账户余额。
+DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 token 用量与账户余额。隐藏后由一枚小圆钮代替它待在桌面上——圆钮既是唤回的按钮，也是上下文占用与余额的常驻读数。
 
 [English](README.md) · [Español](README-es.md) · [हिन्दी](README-hi.md) · [Português](README-pt.md)
 
@@ -18,6 +18,15 @@ DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 to
 
 插件接口本身开不出浮窗：Client 模块（`dsh.client`）跑在 harness 页面里，Host 插件跑在 Node 里、拿不到 Electron 的窗口 API。所以浮窗仍然是独立进程，而这个插件负责管理它——激活时拉起、卸载时终止、崩溃后重启。
 
+这个进程管着**两个窗口，同一时刻只显示其中一个**：
+
+| 窗口 | 何时在屏幕上 |
+|---|---|
+| 桌宠本体 | 平时 |
+| 小圆钮（standby medallion） | 桌宠被隐藏时 |
+
+圆钮是必需的，不是装饰：桌面端自身**没有**「显示桌宠」开关，所以隐藏曾经是一扇单向门——`visible: false` 会被记住，而没有任何东西能把它改回来。圆钮补上了这个缺口，顺便把两个最该盯着看的数字顶在脸上：**上下文占用百分比**（脸外那圈进度环，同时以数字显示）和**账户余额**。
+
 浮窗自己读数据，不向 harness 要任何东西：
 
 | 显示 | 来源 |
@@ -27,14 +36,35 @@ DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 to
 
 因为注册走的是单个 `ctx.effect()`，**在 harness 里关掉插件就等于关掉桌宠**，热重载也不会留下孤儿进程。
 
+## Using it
+
+| 操作 | 结果 |
+|---|---|
+| 拖动 | 移动桌宠。松手后位置会被记住，**点击不会**把它弹回屏幕角落 |
+| 单击 | 拍一下：播放一次果冻式挤压动画，仅此而已 |
+| 双击 | 打开 / 唤到最前 DeepSeek Harness 主窗口 |
+| 右键 | 菜单：打开 Harness、刷新用量与余额、**桌宠大小**（75% / 100% / 125% / 150%）、隐藏桌宠、显示在右下角、退出桌宠 |
+| 右键 → 隐藏桌宠 | 桌宠消失，圆钮出现在它刚才站的位置 |
+| 单击圆钮 | 桌宠回来，圆钮消失 |
+| 拖动圆钮 | 换地方；位置同样会被记住 |
+| 右键圆钮 | 菜单：唤回桌宠、打开 Harness、刷新、桌宠大小、退出桌宠 |
+
+圆钮第一次出现时会顶着一个小气泡说「点我唤回桌宠」，五秒后自己消失——那是它唯一一次自我介绍。
+
+桌宠大小是**整窗等比缩放**（用 `setZoomFactor`，所以文字、描边、命中区域一起缩放，布局不会错位），并以底边中点为锚点，脚不会跳。缩放是在菜单里即时生效并记住的；插件配置里的 `scale` 只是首次启动的初值。
+
+设置保存在 `<DSH 主目录>/desktop/pet-window.json`：位置、可见性、缩放比例和圆钮的位置。
+
 ## Install
 
 ```sh
 pnpm pack
-dsh plugin --profile desktop add ./dsh-desktop-pet-0.1.0.tgz
+dsh plugin --profile desktop add ./dsh-desktop-pet-0.2.0.tgz
 ```
 
 ⚠️ 用**目录路径**安装不会注册 bundle——必须是 tarball（或 npm / git 源）。装完要重启桌面端，bundle 插件在启动时加载。
+
+同名版本的 tarball 内容变了 pnpm **不会**重装（`file:` 依赖按锁文件里的 integrity 判定为「已是最新」）。改了代码要重装的话，先 `dsh plugin --profile desktop remove dsh-desktop-pet` 再 `add`。
 
 浮窗宿主是 `electron`，作为普通依赖安装。pnpm 的构建脚本审批门必须放行它——harness 会把这个决定留在 profile 的 `pnpm-workspace.yaml` 里：
 
@@ -43,20 +73,25 @@ allowBuilds:
   electron: true
 ```
 
+如果 profile 里的 electron 因为 pnpm 的 side-effects 缓存问题装残了（缺 `electron.exe`），把一份独立运行时放到 `<DSH 主目录>/desktop-pet-runtime` 即可：插件优先用它，profile 里的那份坏了也不影响。
+
 ## Configuration
 
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `enabled` | boolean | `true` | 插件激活时是否拉起浮窗 |
-| `command` | string | `''` | 承载浮窗的可执行文件。留空则通过模块系统解析 `electron`，因此 hoisted 与嵌套链接都能用 |
+| `command` | string | `''` | 承载浮窗的可执行文件。留空则用 `<DSH 主目录>/desktop-pet-runtime` 里的 electron，其次在包目录附近逐个目录查找 |
 | `args` | string[] | `[]` | 传给 `command` 的参数。留空则运行随包分发的浮窗入口 |
-| `cwd` | string | `''` | 浮窗进程的工作目录。留空用 `<插件>/workspace`——**刻意不取用户主目录**，那里的 `NTUSER.DAT` 锁会让文件监视器挂掉 |
+| `cwd` | string | `''` | 浮窗进程的工作目录。留空用 `<DSH 主目录>/desktop-pet`——**刻意不取用户主目录**（那里的 `NTUSER.DAT` 锁会让文件监视器挂掉），也不放插件包内（运行中的浮窗会锁住包目录，导致 `ERR_PNPM_EPERM` 让插件永远无法更新） |
 | `restartDelayMs` | number | `2000` | 异常退出后重新拉起的延迟。`0` 表示不再重启 |
 | `maxRestarts` | number | `5` | 连续重启次数上限，超过后停止并记录一次错误 |
+| `scale` | number | `1` | 桌宠**初始**缩放比例，0.5–2（常用 `0.75` / `1` / `1.25` / `1.5`）。之后在菜单里改的值会记住并覆盖它 |
 
 配置由 `lib/index.js` 的 Schemastery `Config` schema 校验；没有硬编码的可调项。非法值在加载期响亮失败，而不是静默取默认值。
 
 正常退出（`code 0`）被视为用户主动关闭桌宠，**永不重启**；只有异常退出才计入 `maxRestarts`。
+
+浮窗进程还在 `127.0.0.1:52118` 上开了一个控制端口（`status` / `show` / `hide` / `toggle` / `snap` / `scale:<比例>` / `quit`），一行一条命令。它顺便充当单实例锁——桌宠在每次桌面端启动时都会被拉起，没有锁就会越堆越多。
 
 ## Development
 

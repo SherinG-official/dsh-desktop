@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop-pet",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness desktop pet: a floating window with live token usage and account balance, managed as a Host plugin. See README-zh.md.",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness desktop pet: a floating mascot with live token usage and account balance, plus a standby medallion that brings it back and shows context pressure. Managed as a Host plugin. See README-zh.md.",
   "type": "module",
   "main": "lib/index.js",
   "files": [

@@ -57,7 +57,13 @@ describe('plugin contract', () => {
     expect(cfg.enabled).toBe(true)
     expect(cfg.restartDelayMs).toBe(2000)
     expect(cfg.maxRestarts).toBe(5)
+    expect(cfg.scale).toBe(1)
     expect(Array.isArray(cfg.args)).toBe(true)
+  })
+
+  it('accepts a size and hands it to the window as its initial scale', () => {
+    expect(Config({ scale: 1.25 }).scale).toBe(1.25)
+    expect(Config({ scale: 0.75 }).scale).toBe(0.75)
   })
 
   it('rejects an invalid config loudly instead of silently defaulting', () => {

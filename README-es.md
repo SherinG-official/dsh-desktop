@@ -1,6 +1,6 @@
-﻿# dsh-desktop-pet
+# dsh-desktop-pet
 
-Mascota de escritorio para DeepSeek Harness: una ventana flotante siempre visible que muestra el uso de tokens y el saldo en vivo.
+Mascota de escritorio para DeepSeek Harness: una ventana flotante siempre visible que muestra el uso de tokens y el saldo en vivo. Si la ocultas, un pequeno medallon ocupa su lugar: es a la vez el boton para recuperarla y un indicador permanente de la presion de contexto y del saldo.
 
 [English](README.md) · [中文](README-zh.md) · [हिन्दी](README-hi.md) · [Português](README-pt.md)
 
@@ -20,27 +20,47 @@ Una ventana flotante no puede crearse desde la superficie de plugins: un modulo 
 
 La ventana lee sus propios datos: uso de tokens desde las filas de proyeccion `tokenUsage` del motor, y saldo desde `GET https://api.deepseek.com/user/balance`.
 
+Ese proceso tiene **dos ventanas y solo una visible a la vez**: la mascota, y el medallon que la sustituye mientras esta oculta. El medallon no es decorativo: el shell de escritorio no tiene ningun interruptor para volver a mostrar la mascota, asi que ocultarla era una puerta de un solo sentido. El medallon lo arregla y ademas muestra el anillo de presion de contexto y el saldo.
+
+## Using it
+
+| Gesto | Resultado |
+|---|---|
+| Arrastrar | Mueve la mascota. La posicion se recuerda; un clic **no** la devuelve a la esquina |
+| Clic | Una sacudida y nada mas |
+| Doble clic | Abre la ventana de DeepSeek Harness |
+| Clic derecho | Menu: abrir Harness, refrescar, **tamano** (75% / 100% / 125% / 150%), ocultar, mover a la esquina, salir |
+| Clic en el medallon | La mascota vuelve y el medallon desaparece |
+| Arrastrar el medallon | Lo mueve; la posicion tambien se recuerda |
+
+El tamano es un escalado de toda la ventana (`setZoomFactor`), anclado en el centro inferior para que los pies no salten. El estado vive en `<DSH home>/desktop/pet-window.json`.
+
 ## Install
 
 ```sh
 pnpm pack
-dsh plugin --profile desktop add ./dsh-desktop-pet-0.1.0.tgz
+dsh plugin --profile desktop add ./dsh-desktop-pet-0.2.0.tgz
 ```
 
 Instalar desde una **ruta de directorio** no registra el bundle: debe ser un tarball (o npm/git). Reinicia la aplicacion despues; los bundles se cargan al arrancar. El anfitrion de la ventana es `electron`, instalado como dependencia normal, y la puerta de compilacion de pnpm debe permitirlo en `pnpm-workspace.yaml` (`allowBuilds: electron: true`).
+
+pnpm **no** reinstala un tarball cuya version no cambia aunque su contenido cambie: usa la integridad del lockfile. Para recoger codigo nuevo, quita el plugin y vuelve a anadirlo.
 
 ## Configuration
 
 | Clave | Tipo | Por defecto | Descripcion |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Iniciar la ventana al activar el plugin |
-| `command` | string | `''` | Ejecutable anfitrion; vacio resuelve `electron` por el sistema de modulos |
+| `command` | string | `''` | Ejecutable anfitrion; vacio prefiere `<DSH home>/desktop-pet-runtime` |
 | `args` | string[] | `[]` | Argumentos para `command` |
-| `cwd` | string | `''` | Directorio de trabajo; vacio usa `<plugin>/workspace`, nunca el perfil de usuario |
+| `cwd` | string | `''` | Directorio de trabajo; vacio usa `<DSH home>/desktop-pet`, nunca el perfil de usuario ni el directorio del plugin |
 | `restartDelayMs` | number | `2000` | Retardo antes de reiniciar tras una salida anormal |
 | `maxRestarts` | number | `5` | Reinicios consecutivos permitidos |
+| `scale` | number | `1` | Tamano **inicial** de la mascota, 0.5–2 |
 
 La configuracion la valida el esquema Schemastery; ningun valor ajustable esta fijado en el codigo. Una salida limpia (`code 0`) se considera un cierre deliberado y nunca se reinicia.
+
+El proceso escucha ademas en `127.0.0.1:52118` (`status`, `show`, `hide`, `toggle`, `snap`, `scale:<n>`, `quit`), lo que a la vez sirve de cerrojo de instancia unica.
 
 ## Development
 

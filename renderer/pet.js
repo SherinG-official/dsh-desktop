@@ -152,18 +152,16 @@ function render(state) {
 // ------------------------------------------------------------------ gestures --
 let dragging = false;
 let moved = 0;
-// offset from the window's top-left to the grabbed point, in screen pixels
-let grab = { x: 0, y: 0 };
-let pending = null;
+let pending = false;
 let frameRequested = false;
 
 document.addEventListener('pointerdown', (event) => {
   if (event.button !== 0 && event.button != null) return;
   dragging = true;
   moved = 0;
-  grab = { x: event.screenX - window.screenX, y: event.screenY - window.screenY };
   document.body.classList.add('dragging');
-  // tell the main process a drag started, so it can police the window's size
+  // tell the main process a drag started: it notes where in the window the
+  // cursor grabbed the pet, and afterwards follows the cursor itself
   try { const r = api.dragBegin(); if (r && r.catch) r.catch(() => {}); } catch { /* ignore */ }
   // keep receiving moves even when the cursor leaves this small window
   if (document.body.setPointerCapture) {
@@ -177,24 +175,22 @@ document.addEventListener('pointermove', (event) => {
 
   // Move on the next frame at most: dragging a transparent window is expensive,
   // and the compositor needs the chance to keep the bubble in step with the art.
-  pending = { x: event.screenX, y: event.screenY };
+  //
+  // The renderer sends no coordinates. It reports cursor positions in CSS
+  // pixels, which page zoom and display scaling both redefine, while the window
+  // is placed in device-independent pixels — so the main process reads the
+  // cursor from the OS and puts the grabbed point back under it.
+  pending = true;
   if (frameRequested) return;
   frameRequested = true;
   requestAnimationFrame(() => {
     frameRequested = false;
     if (!pending) return;
-    const point = pending;
-    pending = null;
-    // The window is positioned so the grabbed point stays exactly under the
-    // cursor. It is deliberately NOT clamped to the work area here: clamping
-    // mid-drag stalls the window at a screen edge while the cursor keeps going,
-    // which makes the character slide out from under the pointer.
-    const x = Math.round(point.x - grab.x);
-    const y = Math.round(point.y - grab.y);
+    pending = false;
     try {
       // A failed frame must never escape as an unhandled rejection: that killed
       // the whole renderer once, which made the window refuse to open at all.
-      const result = api.moveTo(x, y);
+      const result = api.follow();
       if (result && typeof result.catch === 'function') result.catch(reportDragError);
     } catch (error) {
       reportDragError(error);
@@ -212,7 +208,7 @@ function reportDragError(error) {
 function endDrag(event) {
   if (!dragging) return;
   dragging = false;
-  pending = null;
+  pending = false;
   document.body.classList.remove('dragging');
   try { const r = api.dragEnd(); if (r && r.catch) r.catch(() => {}); } catch { /* ignore */ }
   // snap back into the work area now that the gesture is over
@@ -227,8 +223,10 @@ function endDrag(event) {
   // are treated as primary so scripted drags still click.
   const isPrimary = typeof event.button === 'number' ? event.button === 0 : true;
   if (moved < 6 && isPrimary) {
+    // A click pats the pet — nothing else. It used to also snap the window to
+    // the corner, which threw away a position the user had just dragged it to;
+    // "显示在右下角" is still in the right-click menu for when that is wanted.
     squash();
-    api.snap();
   }
 }
 

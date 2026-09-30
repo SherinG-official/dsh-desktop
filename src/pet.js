@@ -13,9 +13,14 @@
  *   balance     -> GET https://api.deepseek.com/user/balance (via ./balance)
  *   art         -> assets/pet/*.png, pushed to the renderer as blob urls
  *
- * It is a single window and a tray-free process: no tray, no menus, no engine.
- * The only thing it needs from outside is "show the main window", which it asks
- * for by connecting to a loopback focus port (see focus-port.js).
+ * It owns two windows: the mascot, and a small medallion that stands in for it
+ * while it is hidden. Exactly one of them is on screen at a time; the medallion
+ * exists because hiding the pet used to be a one-way door — the desktop shell
+ * has no "show the pet" switch, so nothing could bring it back.
+ *
+ * It is a single process with no tray and no menus of its own. The only thing it
+ * needs from outside is "show the main window", which it asks for by connecting
+ * to a loopback focus port (see focus-port.js).
  *
  * Three ways to start it, all reaching run() below:
  *   npm run pet                       a dev checkout
@@ -34,13 +39,45 @@ const util = require('./util');
 const { FOCUS_PORT, PET_CONTROL_PORT } = require('./focus-port');
 
 const ROOT = path.join(__dirname, '..');
-const PET_SIZE = { width: 330, height: 440 };
+
+/**
+ * Each window draws into a fixed logical canvas and the window is scaled to fit.
+ *
+ * Scaling the window alone would only crop the art, and rewriting every offset
+ * in the layout for each size would put the bubble and the badge out of step the
+ * first time someone forgot one. `setZoomFactor` scales the whole renderer —
+ * art, text, borders, hit testing — so the canvas stays 330x440 (and the
+ * medallion 148x176) at every setting and only the physical size changes.
+ */
+const PET_BASE = { width: 330, height: 440 };
+const LAUNCHER_BASE = { width: 148, height: 176 };
+const SCALES = [0.75, 1, 1.25, 1.5];
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 2;
+
 const STATE_FILE = path.join(util.dshHome(), 'desktop', 'pet-window.json');
 
 let metrics;
 let balance;
 let petWindow = null;
+let launcherWindow = null;
 let controlServer = null;
+
+/** Current zoom, shared by both windows. */
+let scale = 1;
+
+/**
+ * Where inside each window the cursor grabbed it, in screen coordinates.
+ *
+ * The drag is driven from the *cursor*, not from the coordinates the renderer
+ * reports. `event.screenX` and `window.screenX` are in CSS pixels — which page
+ * zoom and display scaling both redefine — while `setBounds` wants screen
+ * device-independent pixels. Asking the OS for the cursor position keeps both
+ * sides in the one coordinate space the main process controls, so dragging stays
+ * exact at 75% and at 150% alike.
+ */
+let petGrab = null;
+let launcherGrab = null;
 
 function readState() {
   return util.readJsonSafe(STATE_FILE) || {};
@@ -56,11 +93,92 @@ function writeState(patch) {
   }
 }
 
+// --------------------------------------------------------------------- scale ---
+/** Accepts anything within range; snaps to the offered ladder when it is close. */
+function normalizeScale(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < MIN_SCALE || n > MAX_SCALE) return null;
+  const offered = SCALES.find((candidate) => Math.abs(candidate - n) < 0.001);
+  return offered || Math.round(n * 100) / 100;
+}
+
+/** Saved choice wins, then the plugin's configured default, then 100%. */
+function resolveInitialScale() {
+  return normalizeScale(readState().scale)
+    || normalizeScale(process.env.DSH_PET_SCALE)
+    || 1;
+}
+
+function scaled(base) {
+  return { width: Math.round(base.width * scale), height: Math.round(base.height * scale) };
+}
+
+function petSize() { return scaled(PET_BASE); }
+function launcherSize() { return scaled(LAUNCHER_BASE); }
+
+/**
+ * Fixes a window's size for good.
+ *
+ * Both windows are pinned to min == max == their current size: nothing on the
+ * desktop may resize them (Windows' snap handling grabs a frameless window by
+ * its edges), and every later `setBounds` is expected to move only. A size
+ * change therefore has to re-pin *before* moving, which is exactly what
+ * setScale() does — setting the pin to the new size first means the following
+ * setBounds is not clamped back to the old one.
+ */
+function pinSize(win, size) {
+  if (!win || win.isDestroyed()) return;
+  try {
+    win.setMinimumSize(size.width, size.height);
+    win.setMaximumSize(size.width, size.height);
+  } catch { /* ignore */ }
+}
+
+function applyZoom(win) {
+  if (!win || win.isDestroyed()) return;
+  try { win.webContents.setZoomFactor(scale); } catch { /* not loaded yet */ }
+}
+
+/**
+ * Changes the zoom, keeping each window's bottom edge and horizontal centre
+ * where they were — the mascot stands on the desktop, so its feet should not
+ * jump when it grows.
+ */
+function setScale(value) {
+  const next = normalizeScale(value);
+  if (!next || next === scale) return false;
+  scale = next;
+  writeState({ scale });
+
+  for (const [win, size, key] of [
+    [petWindow, petSize(), 'bounds'],
+    [launcherWindow, launcherSize(), 'launcherBounds'],
+  ]) {
+    if (!win || win.isDestroyed()) continue;
+    const bounds = win.getBounds();
+    const target = {
+      x: Math.round(bounds.x + bounds.width / 2 - size.width / 2),
+      y: Math.round(bounds.y + bounds.height - size.height),
+      width: size.width,
+      height: size.height,
+    };
+    pinSize(win, size);
+    win.setBounds(target);
+    writeState({ [key]: win.getBounds() });
+    applyZoom(win);
+  }
+
+  push();
+  raiseWindows();
+  return true;
+}
+
 // --------------------------------------------------------------------- state ---
 function snapshot() {
   const tokens = metrics.state;
   const money = balance.state;
   return {
+    scale,
     tokens: {
       session: tokens.liveSession,
       title: tokens.liveTitle,
@@ -90,14 +208,45 @@ function snapshot() {
 
 function push() {
   const state = snapshot();
-  if (petWindow && !petWindow.isDestroyed()) {
-    petWindow.webContents.send('state:update', state);
-    petWindow.setTitle(`DSH 桌宠 · ${state.compact.tokens} tokens · ${state.compact.balance}`);
+  for (const win of [petWindow, launcherWindow]) {
+    if (!win || win.isDestroyed()) continue;
+    try { win.webContents.send('state:update', state); } catch { /* not listening yet */ }
+  }
+  const title = `DSH 桌宠 · ${state.compact.tokens} tokens · ${state.compact.balance}`;
+  if (petWindow && !petWindow.isDestroyed()) petWindow.setTitle(title);
+  if (launcherWindow && !launcherWindow.isDestroyed()) {
+    const percent = state.compact.contextPercent;
+    launcherWindow.setTitle(`DSH 桌宠 · 上下文 ${percent == null ? '—' : `${percent}%`} · ${state.compact.balance}`);
   }
   return state;
 }
 
-// -------------------------------------------------------------------- window ---
+// -------------------------------------------------------------------- layout ---
+function areaOfPoint(x, y) {
+  const display = screen.getDisplayNearestPoint({ x: Math.round(x), y: Math.round(y) })
+    || screen.getPrimaryDisplay();
+  return display.workArea;
+}
+
+/** The work area a remembered rectangle still belongs to, or null when it is gone. */
+function areaContaining(bounds) {
+  if (!bounds || !Number.isFinite(bounds.x) || !Number.isFinite(bounds.y)) return null;
+  const width = Number.isFinite(bounds.width) ? bounds.width : 0;
+  const height = Number.isFinite(bounds.height) ? bounds.height : 0;
+  const centre = { x: Math.round(bounds.x + width / 2), y: Math.round(bounds.y + height / 2) };
+  const area = areaOfPoint(centre.x, centre.y);
+  if (centre.x < area.x || centre.x >= area.x + area.width) return null;
+  if (centre.y < area.y || centre.y >= area.y + area.height) return null;
+  return { area, width, height };
+}
+
+function clampToArea(rect, area) {
+  return {
+    x: Math.round(Math.min(Math.max(rect.x, area.x), area.x + area.width - rect.width)),
+    y: Math.round(Math.min(Math.max(rect.y, area.y), area.y + area.height - rect.height)),
+  };
+}
+
 /**
  * Where the pet should open.
  *
@@ -107,32 +256,61 @@ function push() {
  * screen, where the window is technically shown and completely unseeable.
  */
 function resolveStartPosition() {
+  const size = petSize();
   const saved = readState().bounds;
-  const plausible = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)
-    && saved.width >= PET_SIZE.width - 8 && saved.height >= PET_SIZE.height - 8;
-  if (plausible) {
-    const centre = {
-      x: Math.round(saved.x + PET_SIZE.width / 2),
-      y: Math.round(saved.y + PET_SIZE.height / 2),
-    };
-    const area = (screen.getDisplayNearestPoint(centre) || screen.getPrimaryDisplay()).workArea;
-    const onScreen = centre.x >= area.x && centre.x < area.x + area.width
-      && centre.y >= area.y && centre.y < area.y + area.height;
-    if (onScreen) return { x: saved.x, y: saved.y };
+  const fit = areaContaining(saved);
+  if (fit && fit.width >= size.width - 8 && fit.height >= size.height - 8) {
+    return { x: Math.round(saved.x), y: Math.round(saved.y) };
   }
   const area = screen.getPrimaryDisplay().workArea;
   return {
-    x: area.x + area.width - PET_SIZE.width - 16,
-    y: area.y + area.height - PET_SIZE.height - 16,
+    x: area.x + area.width - size.width - 16,
+    y: area.y + area.height - size.height - 16,
   };
 }
 
+/**
+ * Where the medallion should open.
+ *
+ * It takes over the spot the mascot last stood on, so hiding looks like the
+ * character shrank rather than teleported. A position the user dragged it to is
+ * preferred over that; both are dropped in favour of the primary display's
+ * corner when the remembered spot is on a monitor that no longer exists.
+ */
+function resolveLauncherPosition() {
+  const size = launcherSize();
+  const state = readState();
+
+  const savedFit = areaContaining(state.launcherBounds);
+  if (savedFit && savedFit.width >= size.width - 8 && savedFit.height >= size.height - 8) {
+    return { x: Math.round(state.launcherBounds.x), y: Math.round(state.launcherBounds.y) };
+  }
+
+  const petFit = areaContaining(state.bounds);
+  if (petFit && petFit.width >= 8 && petFit.height >= 8) {
+    return clampToArea({
+      x: state.bounds.x + petFit.width / 2 - size.width / 2,
+      y: state.bounds.y + petFit.height - size.height,
+      width: size.width,
+      height: size.height,
+    }, petFit.area);
+  }
+
+  const area = screen.getPrimaryDisplay().workArea;
+  return {
+    x: area.x + area.width - size.width - 16,
+    y: area.y + area.height - size.height - 16,
+  };
+}
+
+// -------------------------------------------------------------------- window ---
 function createPetWindow() {
+  const size = petSize();
   const { x, y } = resolveStartPosition();
 
   petWindow = new BrowserWindow({
-    width: PET_SIZE.width,
-    height: PET_SIZE.height,
+    width: size.width,
+    height: size.height,
     x,
     y,
     frame: false,
@@ -158,75 +336,178 @@ function createPetWindow() {
   // highest z-order level plus periodic raising: another topmost window (a
   // maximised player, say) otherwise sits above the pet and eats its clicks
   try { petWindow.setAlwaysOnTop(true, 'screen-saver'); } catch { /* older electron */ }
+  pinSize(petWindow, size);
+  applyZoom(petWindow);
 
   petWindow.loadFile(path.join(ROOT, 'renderer', 'pet.html'));
+  petWindow.webContents.on('did-finish-load', () => {
+    applyZoom(petWindow);
+    push();
+  });
   petWindow.once('ready-to-show', () => {
     if (readState().visible !== false) {
       petWindow.showInactive();
-      try { petWindow.moveTop(); } catch { /* ignore */ }
+      syncChrome(true);
+    } else {
+      syncChrome(false);
     }
+    push();
   });
   petWindow.on('moved', () => {
     if (petWindow && !petWindow.isDestroyed()) writeState({ bounds: petWindow.getBounds() });
   });
   petWindow.on('closed', () => { petWindow = null; });
 
-  const topGuard = setInterval(() => {
-    if (petWindow && !petWindow.isDestroyed() && petWindow.isVisible()) {
-      try { petWindow.moveTop(); } catch { /* ignore */ }
-    }
-  }, 20000);
-  if (typeof topGuard.unref === 'function') topGuard.unref();
-
   return petWindow;
+}
+
+/**
+ * The medallion that stands in for a hidden pet.
+ *
+ * Built on first use rather than at startup: a user who never hides the pet
+ * never pays for a second renderer process.
+ */
+function createLauncherWindow() {
+  if (launcherWindow && !launcherWindow.isDestroyed()) return launcherWindow;
+
+  const size = launcherSize();
+  const { x, y } = resolveLauncherPosition();
+
+  launcherWindow = new BrowserWindow({
+    width: size.width,
+    height: size.height,
+    x,
+    y,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: false,
+    show: false,
+    backgroundColor: '#00000000',
+    title: 'DSH 桌宠',
+    webPreferences: {
+      preload: path.join(__dirname, 'pet-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+    },
+  });
+
+  try { launcherWindow.setAlwaysOnTop(true, 'screen-saver'); } catch { /* older electron */ }
+  pinSize(launcherWindow, size);
+  applyZoom(launcherWindow);
+
+  launcherWindow.loadFile(path.join(ROOT, 'renderer', 'launcher.html'));
+  launcherWindow.webContents.on('did-finish-load', () => {
+    applyZoom(launcherWindow);
+    push();
+  });
+  launcherWindow.on('moved', () => {
+    if (launcherWindow && !launcherWindow.isDestroyed()) {
+      writeState({ launcherBounds: launcherWindow.getBounds() });
+    }
+  });
+  launcherWindow.on('closed', () => { launcherWindow = null; });
+
+  return launcherWindow;
+}
+
+function raiseWindows() {
+  for (const win of [petWindow, launcherWindow]) {
+    if (!win || win.isDestroyed() || !win.isVisible()) continue;
+    try { win.moveTop(); } catch { /* ignore */ }
+  }
+}
+
+/** Exactly one window is on screen: the mascot, or the medallion standing in for it. */
+function syncChrome(petShown) {
+  if (petShown) hideLauncher();
+  else showLauncher();
+}
+
+function hideLauncher() {
+  if (launcherWindow && !launcherWindow.isDestroyed() && launcherWindow.isVisible()) {
+    launcherWindow.hide();
+  }
+}
+
+function showLauncher() {
+  const win = createLauncherWindow();
+  if (!win || win.isDestroyed()) return false;
+
+  // the saved spot may no longer exist (monitor unplugged, resolution change),
+  // and an off-screen medallion is indistinguishable from a missing one
+  const size = launcherSize();
+  const bounds = win.getBounds();
+  const area = areaOfPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  const fits = bounds.x + bounds.width > area.x && bounds.x < area.x + area.width
+    && bounds.y + bounds.height > area.y && bounds.y < area.y + area.height;
+  if (!fits) {
+    const target = {
+      ...clampToArea({ x: bounds.x, y: bounds.y, width: size.width, height: size.height }, area),
+      width: size.width,
+      height: size.height,
+    };
+    win.setBounds(target);
+    writeState({ launcherBounds: target });
+  }
+
+  if (!win.isVisible()) win.showInactive();
+  try { win.moveTop(); } catch { /* ignore */ }
+  return true;
 }
 
 function hidePet() {
   writeState({ visible: false });
   if (petWindow && !petWindow.isDestroyed()) petWindow.hide();
+  syncChrome(false);
 }
 
-/**
- * Bring the pet back — and make it stick.
- *
- * Hiding used to be a one-way door: hidePet() persisted visible:false and the
- * window only ever auto-showed when that flag was not false, so nothing could
- * undo it. A pet started after a hide therefore came up invisible with no way
- * back, which reads exactly like "the pet is broken".
- */
 function showPet() {
-  writeState({ visible: true });
   if (!petWindow || petWindow.isDestroyed()) return false;
+  writeState({ visible: true });
 
   // the saved spot may no longer exist (monitor unplugged, resolution change),
   // and an off-screen window is indistinguishable from a missing one
+  const size = petSize();
   const bounds = petWindow.getBounds();
-  const center = {
-    x: Math.round(bounds.x + bounds.width / 2),
-    y: Math.round(bounds.y + bounds.height / 2),
-  };
-  const area = (screen.getDisplayNearestPoint(center) || screen.getPrimaryDisplay()).workArea;
+  const area = areaOfPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
   const fits = bounds.x + bounds.width > area.x && bounds.x < area.x + area.width
     && bounds.y + bounds.height > area.y && bounds.y < area.y + area.height;
   if (!fits) {
     const target = {
-      x: Math.min(Math.max(bounds.x, area.x), area.x + area.width - PET_SIZE.width),
-      y: Math.min(Math.max(bounds.y, area.y), area.y + area.height - PET_SIZE.height),
-      width: PET_SIZE.width,
-      height: PET_SIZE.height,
+      ...clampToArea({ x: bounds.x, y: bounds.y, width: size.width, height: size.height }, area),
+      width: size.width,
+      height: size.height,
     };
     petWindow.setBounds(target);
     writeState({ bounds: target });
   }
 
   petWindow.showInactive();
-  try { petWindow.moveTop(); } catch { /* ignore */ }
+  syncChrome(true);
+  raiseWindows();
+  push();
   return true;
 }
 
 function petIsVisible() {
   // the window is the truth; the flag alone can be stale
   return Boolean(petWindow && !petWindow.isDestroyed() && petWindow.isVisible());
+}
+
+function launcherIsVisible() {
+  return Boolean(launcherWindow && !launcherWindow.isDestroyed() && launcherWindow.isVisible());
+}
+
+function togglePet() {
+  if (petIsVisible()) hidePet();
+  else showPet();
 }
 
 /**
@@ -237,12 +518,13 @@ function petIsVisible() {
  */
 function snapToCorner() {
   if (!petWindow || petWindow.isDestroyed()) return false;
+  const size = petSize();
   const area = screen.getPrimaryDisplay().workArea;
   const target = {
-    x: area.x + area.width - PET_SIZE.width - 12,
-    y: area.y + area.height - PET_SIZE.height - 12,
-    width: PET_SIZE.width,
-    height: PET_SIZE.height,
+    x: area.x + area.width - size.width - 12,
+    y: area.y + area.height - size.height - 12,
+    width: size.width,
+    height: size.height,
   };
   petWindow.setBounds(target);
   writeState({ bounds: target });
@@ -250,16 +532,125 @@ function snapToCorner() {
   return true;
 }
 
+// ------------------------------------------------------------------- gestures ---
+function windowOf(which) {
+  return which === 'launcher' ? launcherWindow : petWindow;
+}
+
+function sizeOf(which) {
+  return which === 'launcher' ? launcherSize() : petSize();
+}
+
+function stateKeyOf(which) {
+  return which === 'launcher' ? 'launcherBounds' : 'bounds';
+}
+
+function beginDrag(which) {
+  const win = windowOf(which);
+  if (!win || win.isDestroyed()) return false;
+  const point = screen.getCursorScreenPoint();
+  const bounds = win.getBounds();
+  const grab = { dx: point.x - bounds.x, dy: point.y - bounds.y };
+  if (which === 'launcher') launcherGrab = grab;
+  else petGrab = grab;
+  return true;
+}
+
+/** One frame of dragging: put the grabbed point back under the cursor. */
+function followCursor(which) {
+  const win = windowOf(which);
+  const grab = which === 'launcher' ? launcherGrab : petGrab;
+  if (!grab || !win || win.isDestroyed()) return false;
+  const size = sizeOf(which);
+  const point = screen.getCursorScreenPoint();
+  // Deliberately NOT clamped to the work area: clamping mid-drag stalls the
+  // window at a screen edge while the cursor keeps going, which makes the
+  // character slide out from under the pointer.
+  win.setBounds({
+    x: Math.round(point.x - grab.dx),
+    y: Math.round(point.y - grab.dy),
+    width: size.width,
+    height: size.height,
+  });
+  return true;
+}
+
+function endDrag(which) {
+  const win = windowOf(which);
+  if (which === 'launcher') launcherGrab = null;
+  else petGrab = null;
+  if (!win || win.isDestroyed()) return false;
+  writeState({ [stateKeyOf(which)]: win.getBounds() });
+  return true;
+}
+
+/** Only writes when the window is genuinely outside: setBounds can nudge by a pixel. */
+function clampWindow(which) {
+  const win = windowOf(which);
+  if (!win || win.isDestroyed()) return null;
+  const size = sizeOf(which);
+  const bounds = win.getBounds();
+  const area = areaOfPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  const right = area.x + area.width - size.width;
+  const bottom = area.y + area.height - size.height;
+  if (bounds.x >= area.x && bounds.y >= area.y && bounds.x <= right + 2 && bounds.y <= bottom + 2) {
+    return bounds;
+  }
+  const target = {
+    x: Math.min(Math.max(bounds.x, area.x), right),
+    y: Math.min(Math.max(bounds.y, area.y), bottom),
+    width: size.width,
+    height: size.height,
+  };
+  win.setBounds(target);
+  writeState({ [stateKeyOf(which)]: win.getBounds() });
+  return target;
+}
+
+/** Bottom-right of whichever display the window currently sits on. */
+function snapWindow(which) {
+  const win = windowOf(which);
+  if (!win || win.isDestroyed()) return false;
+  const size = sizeOf(which);
+  const bounds = win.getBounds();
+  const area = areaOfPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  const target = {
+    x: area.x + area.width - size.width - 12,
+    y: area.y + area.height - size.height - 12,
+    width: size.width,
+    height: size.height,
+  };
+  const same = bounds.x === target.x && bounds.y === target.y
+    && bounds.width === target.width && bounds.height === target.height;
+  if (!same) win.setBounds(target);
+  writeState({ [stateKeyOf(which)]: target });
+  return true;
+}
+
+function moveWindowTo(which, point) {
+  const win = windowOf(which);
+  if (!win || win.isDestroyed()) return false;
+  const x = point ? Number(point.x) : NaN;
+  const y = point ? Number(point.y) : NaN;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  const size = sizeOf(which);
+  // move WITH the size: Windows can resize a window it sees being repositioned
+  win.setBounds({ x: Math.round(x), y: Math.round(y), width: size.width, height: size.height });
+  return true;
+}
+
 // ------------------------------------------------------------ control channel ---
 /** One command per connection; replies with a single status line. */
 function controlReply(command) {
-  switch (command) {
-    case 'status': return `pet visible=${petIsVisible() ? 1 : 0}`;
+  const [verb, argument] = command.split(/[\s:=]+/);
+  switch (verb) {
+    case 'status':
+      return `pet visible=${petIsVisible() ? 1 : 0} launcher=${launcherIsVisible() ? 1 : 0} scale=${scale}`;
     case 'show':   showPet(); return `pet visible=${petIsVisible() ? 1 : 0}`;
     case 'hide':   hidePet(); return `pet visible=${petIsVisible() ? 1 : 0}`;
     case 'snap':   snapToCorner(); return `pet visible=${petIsVisible() ? 1 : 0}`;
-    case 'toggle': if (petIsVisible()) hidePet(); else showPet();
-      return `pet visible=${petIsVisible() ? 1 : 0}`;
+    case 'toggle': togglePet(); return `pet visible=${petIsVisible() ? 1 : 0}`;
+    case 'scale':  setScale(argument); return `pet scale=${scale}`;
     case 'quit':   setTimeout(() => app.quit(), 50); return 'pet quitting';
     default:       return 'pet unknown-command';
   }
@@ -339,6 +730,44 @@ function requestMainWindow() {
 }
 
 // ---------------------------------------------------------------------- ipc ----
+function scaleSubmenu() {
+  return {
+    label: '桌宠大小',
+    submenu: SCALES.map((value) => ({
+      label: `${Math.round(value * 100)}%`,
+      type: 'radio',
+      checked: Math.abs(scale - value) < 0.001,
+      click: () => setScale(value),
+    })),
+  };
+}
+
+function buildPetMenu() {
+  return Menu.buildFromTemplate([
+    { label: '打开 DeepSeek Harness', click: () => requestMainWindow() },
+    { label: '刷新用量与余额', click: () => { metrics.refresh(); balance.refresh(); push(); } },
+    { type: 'separator' },
+    scaleSubmenu(),
+    { type: 'separator' },
+    { label: '隐藏桌宠', click: () => hidePet() },
+    { label: '显示在右下角', click: () => snapToCorner() },
+    { type: 'separator' },
+    { label: '退出桌宠', click: () => app.quit() },
+  ]);
+}
+
+function buildLauncherMenu() {
+  return Menu.buildFromTemplate([
+    { label: '唤回桌宠', click: () => showPet() },
+    { label: '打开 DeepSeek Harness', click: () => requestMainWindow() },
+    { label: '刷新用量与余额', click: () => { metrics.refresh(); balance.refresh(); push(); } },
+    { type: 'separator' },
+    scaleSubmenu(),
+    { type: 'separator' },
+    { label: '退出桌宠', click: () => app.quit() },
+  ]);
+}
+
 function registerIpc() {
   ipcMain.handle('state:get', () => snapshot());
   ipcMain.handle('state:refresh', async () => {
@@ -351,7 +780,7 @@ function registerIpc() {
     const dir = path.join(ROOT, 'assets', 'pet');
     const frames = {};
     let version = 0;
-    for (const name of ['base', 'chew', 'hover']) {
+    for (const name of ['base', 'chew', 'hover', 'mini']) {
       const file = path.join(dir, `${name}.png`);
       try {
         const buf = fs.readFileSync(file);
@@ -366,103 +795,32 @@ function registerIpc() {
 
   ipcMain.handle('window:show', () => requestMainWindow());
 
-  ipcMain.handle('pet:drag-begin', () => {
-    if (petWindow && !petWindow.isDestroyed()) {
-      try {
-        // pin the size so Windows' snap handling cannot resize the pet mid-drag
-        petWindow.setMinimumSize(PET_SIZE.width, PET_SIZE.height);
-        petWindow.setMaximumSize(PET_SIZE.width, PET_SIZE.height);
-      } catch { /* ignore */ }
-    }
-    return true;
-  });
+  ipcMain.handle('pet:show', () => showPet());
+  ipcMain.handle('pet:hide', () => { hidePet(); return true; });
+  ipcMain.handle('pet:toggle', () => { togglePet(); return petIsVisible(); });
 
-  ipcMain.handle('pet:drag-end', () => {
-    if (petWindow && !petWindow.isDestroyed()) {
-      try {
-        petWindow.setMinimumSize(1, 1);
-        petWindow.setMaximumSize(0, 0);
-        petWindow.setBounds({ ...petWindow.getBounds(), ...PET_SIZE });
-      } catch { /* ignore */ }
-    }
-    return true;
-  });
-
-  ipcMain.handle('pet:move-to', (_event, point) => {
-    if (!petWindow || petWindow.isDestroyed()) return false;
-    const x = point ? Number(point.x) : NaN;
-    const y = point ? Number(point.y) : NaN;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
-    // move WITH the size: Windows can resize a window it sees being repositioned
-    petWindow.setBounds({
-      x: Math.round(x), y: Math.round(y), width: PET_SIZE.width, height: PET_SIZE.height,
-    });
-    return true;
-  });
-
-  /** Only writes when the pet is genuinely outside: setBounds can nudge by a pixel. */
-  ipcMain.handle('pet:clamp', () => {
-    if (!petWindow || petWindow.isDestroyed()) return null;
-    const bounds = petWindow.getBounds();
-    const center = {
-      x: Math.round(bounds.x + bounds.width / 2),
-      y: Math.round(bounds.y + bounds.height / 2),
-    };
-    const area = (screen.getDisplayNearestPoint(center) || screen.getPrimaryDisplay()).workArea;
-    const right = area.x + area.width - PET_SIZE.width;
-    const bottom = area.y + area.height - PET_SIZE.height;
-    if (bounds.x >= area.x && bounds.y >= area.y && bounds.x <= right + 2 && bounds.y <= bottom + 2) {
-      return bounds;
-    }
-    const target = {
-      x: Math.min(Math.max(bounds.x, area.x), right),
-      y: Math.min(Math.max(bounds.y, area.y), bottom),
-      width: PET_SIZE.width,
-      height: PET_SIZE.height,
-    };
-    petWindow.setBounds(target);
-    writeState({ bounds: petWindow.getBounds() });
-    return target;
-  });
-
-  ipcMain.handle('pet:snap', () => {
-    if (!petWindow || petWindow.isDestroyed()) return false;
-    const bounds = petWindow.getBounds();
-    const center = {
-      x: Math.round(bounds.x + bounds.width / 2),
-      y: Math.round(bounds.y + bounds.height / 2),
-    };
-    const area = (screen.getDisplayNearestPoint(center) || screen.getPrimaryDisplay()).workArea;
-    const target = {
-      x: area.x + area.width - PET_SIZE.width - 12,
-      y: area.y + area.height - PET_SIZE.height - 12,
-      width: PET_SIZE.width,
-      height: PET_SIZE.height,
-    };
-    const same = bounds.x === target.x && bounds.y === target.y
-      && bounds.width === target.width && bounds.height === target.height;
-    if (!same) petWindow.setBounds(target);
-    writeState({ bounds: target });
-    return true;
-  });
+  for (const which of ['pet', 'launcher']) {
+    const prefix = which === 'pet' ? 'pet' : 'launcher';
+    ipcMain.handle(`${prefix}:drag-begin`, () => beginDrag(which));
+    ipcMain.handle(`${prefix}:drag-end`, () => endDrag(which));
+    ipcMain.handle(`${prefix}:follow`, () => followCursor(which));
+    ipcMain.handle(`${prefix}:clamp`, () => clampWindow(which));
+    ipcMain.handle(`${prefix}:move-to`, (_event, point) => moveWindowTo(which, point));
+    ipcMain.handle(`${prefix}:snap`, () => snapWindow(which));
+  }
 
   ipcMain.handle('pet:menu', () => {
-    const menu = Menu.buildFromTemplate([
-      { label: '打开 DeepSeek Harness', click: () => requestMainWindow() },
-      { label: '刷新用量与余额', click: () => { metrics.refresh(); balance.refresh(); push(); } },
-      { type: 'separator' },
-      { label: '隐藏桌宠', click: hidePet },
-      { label: '显示在右下角', click: () => snapToCorner() },
-      { type: 'separator' },
-      { label: '退出桌宠', click: () => app.quit() },
-    ]);
-    menu.popup({ window: petWindow });
+    buildPetMenu().popup({ window: petWindow });
+    return true;
+  });
+  ipcMain.handle('launcher:menu', () => {
+    buildLauncherMenu().popup({ window: launcherWindow });
     return true;
   });
 }
 
 // ------------------------------------------------------------------ lifecycle --
-/** Entry point, called from src/main.js when the app is launched with --pet. */
+/** Entry point, called from pet-app/main.js when the process is started with --pet. */
 function run() {
   app.whenReady().then(async () => {
     app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -477,13 +835,20 @@ function run() {
       return;
     }
 
+    scale = resolveInitialScale();
+
     metrics = new Metrics();
     metrics.refresh();
     balance = new Balance({ onUpdate: () => push() });
     balance.start();
 
     registerIpc();
+    // the medallion is built by syncChrome() the first time the pet is hidden —
+    // see createPetWindow()'s ready-to-show handler
     createPetWindow();
+
+    const topGuard = setInterval(() => raiseWindows(), 20000);
+    if (typeof topGuard.unref === 'function') topGuard.unref();
 
     const poll = setInterval(() => {
       metrics.refresh();
@@ -494,7 +859,7 @@ function run() {
     push();
   });
 
-  app.on('window-all-closed', () => app.quit());   // the pet IS the window
+  app.on('window-all-closed', () => app.quit());   // the pet's windows ARE the app
   app.on('will-quit', () => {
     if (balance) balance.stop();
     if (controlServer) {
