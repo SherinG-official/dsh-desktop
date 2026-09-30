@@ -1,0 +1,43 @@
+{
+  "name": "dsh-desktop-pet",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness desktop pet: a floating window with live token usage and account balance, managed as a Host plugin. See README-zh.md.",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "lib/index.js",
+    "cordis.patch.yml",
+    "pet-app",
+    "src",
+    "renderer",
+    "assets"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "electron": "^38.0.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-0 <0.2.0 || >=0.1.7-0 <0.2.0 || >=0.2.0-0 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "vitest": "^3.2.7"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-0 <0.2.0 || >=0.1.7-0 <0.2.0 || >=0.2.0-0 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "license": "Apache-2.0"
+}
