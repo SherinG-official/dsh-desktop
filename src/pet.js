@@ -37,6 +37,7 @@ const { Metrics } = require('./metrics');
 const { Balance } = require('./balance');
 const util = require('./util');
 const { FOCUS_PORT, PET_CONTROL_PORT } = require('./focus-port');
+const { SCALES, normalizeScale } = require('./scales');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -51,9 +52,6 @@ const ROOT = path.join(__dirname, '..');
  */
 const PET_BASE = { width: 330, height: 440 };
 const LAUNCHER_BASE = { width: 148, height: 176 };
-const SCALES = [0.75, 1, 1.25, 1.5];
-const MIN_SCALE = 0.5;
-const MAX_SCALE = 2;
 
 const STATE_FILE = path.join(util.dshHome(), 'desktop', 'pet-window.json');
 
@@ -94,14 +92,6 @@ function writeState(patch) {
 }
 
 // --------------------------------------------------------------------- scale ---
-/** Accepts anything within range; snaps to the offered ladder when it is close. */
-function normalizeScale(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n < MIN_SCALE || n > MAX_SCALE) return null;
-  const offered = SCALES.find((candidate) => Math.abs(candidate - n) < 0.001);
-  return offered || Math.round(n * 100) / 100;
-}
-
 /** Saved choice wins, then the plugin's configured default, then 100%. */
 function resolveInitialScale() {
   return normalizeScale(readState().scale)

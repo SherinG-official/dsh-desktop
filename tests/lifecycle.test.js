@@ -4,27 +4,71 @@ import {
   name,
   Config,
   apply,
+  parsePetStatus,
   resolveCommand,
   resolveArgs,
   resolveCwd,
+  CONTROL_ROUTE,
 } from '../lib/index.js'
 
-/** A stand-in for the harness context that records what the plugin registers. */
-function fakeCtx() {
+/**
+ * A stand-in for the harness context that records what the plugin registers.
+ *
+ * `services` seeds `ctx.inject` with the ones the caller declares available, so
+ * a test can assert both "the control panel waits for a web server" and "the
+ * control panel still exists without one".
+ */
+function fakeCtx(services = {}) {
   const effects = []
   const logs = []
+  const injected = []
+  const routes = []
+  const disposers = []
+
+  // The sub-scope a `ctx.inject` callback receives runs its effects the way the
+  // real context does — immediately, collecting the disposer — because that is
+  // exactly how a route registration reaches the web server.
+  const scope = {
+    effect(fn) {
+      disposers.push(fn())
+      return () => {}
+    },
+    get: (key) => services[key],
+    webServer: services.webServer,
+  }
+
   return {
     effects,
     logs,
+    injected,
+    routes,
+    disposers,
     ctx: {
       effect(fn) {
         effects.push(fn)
+        return () => {}
+      },
+      inject(deps, callback) {
+        injected.push(deps)
+        if (deps.every((dep) => services[dep] !== undefined)) callback(scope, undefined)
         return () => {}
       },
       logger: () => ({
         info: (m) => logs.push(`info: ${m}`),
         error: (m) => logs.push(`error: ${m}`),
       }),
+    },
+  }
+}
+
+/** A web server double that records the routes registered on it. */
+function fakeWebServer(routes) {
+  return {
+    host: '127.0.0.1',
+    port: 19387,
+    register(route) {
+      routes.push(route)
+      return () => {}
     },
   }
 }
@@ -58,6 +102,7 @@ describe('plugin contract', () => {
     expect(cfg.restartDelayMs).toBe(2000)
     expect(cfg.maxRestarts).toBe(5)
     expect(cfg.scale).toBe(1)
+    expect(cfg.controlPanel).toBe(true)
     expect(Array.isArray(cfg.args)).toBe(true)
   })
 
@@ -78,6 +123,59 @@ describe('plugin contract', () => {
     const off = fakeCtx()
     apply(off.ctx, Config({ enabled: false }))
     expect(off.effects).toHaveLength(0)
+  })
+})
+
+describe('control API', () => {
+  it('serves the control route on the web server when one is available', () => {
+    const routes = []
+    const { ctx, injected } = fakeCtx({ webServer: fakeWebServer(routes) })
+    apply(ctx, Config({ enabled: false }))
+
+    expect(injected).toEqual([['webServer']])
+    expect(routes).toHaveLength(1)
+    expect(routes[0].kind).toBe('exact')
+    expect(routes[0].path).toBe(CONTROL_ROUTE)
+    expect(typeof routes[0].handler).toBe('function')
+  })
+
+  it('waits for a web server instead of requiring one', () => {
+    // The pet is a desktop feature. A profile with no web carrier must still get
+    // its pet rather than a plugin that never activates.
+    const { ctx, injected } = fakeCtx()
+    apply(ctx, Config({ enabled: false }))
+    expect(injected).toEqual([['webServer']])
+  })
+
+  it('registers nothing on the web server when the panel is switched off', () => {
+    const routes = []
+    const { ctx, injected } = fakeCtx({ webServer: fakeWebServer(routes) })
+    apply(ctx, Config({ enabled: false, controlPanel: false }))
+    expect(injected).toHaveLength(0)
+    expect(routes).toHaveLength(0)
+  })
+})
+
+describe('control port replies', () => {
+  it('reads the full status line', () => {
+    expect(parsePetStatus('pet visible=1 launcher=0 scale=1.25')).toEqual({
+      raw: 'pet visible=1 launcher=0 scale=1.25',
+      visible: true,
+      launcher: false,
+      scale: 1.25,
+    })
+  })
+
+  it('keeps absent fields absent instead of inventing them', () => {
+    // `hide` answers with `visible` alone: reporting scale=1 there would be a
+    // plausible-looking lie about the size the user picked.
+    expect(parsePetStatus('pet visible=0')).toEqual({ raw: 'pet visible=0', visible: false })
+  })
+
+  it('rejects anything that is not a pet', () => {
+    expect(parsePetStatus(null)).toBeNull()
+    expect(parsePetStatus('')).toBeNull()
+    expect(parsePetStatus('HTTP/1.1 404 Not Found')).toBeNull()
   })
 })
 

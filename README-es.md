@@ -22,6 +22,8 @@ La ventana lee sus propios datos: uso de tokens desde las filas de proyeccion `t
 
 Ese proceso tiene **dos ventanas y solo una visible a la vez**: la mascota, y el medallon que la sustituye mientras esta oculta. El medallon no es decorativo: el shell de escritorio no tiene ningun interruptor para volver a mostrar la mascota, asi que ocultarla era una puerta de un solo sentido. El medallon lo arregla y ademas muestra el anillo de presion de contexto y el saldo.
 
+La misma trampa tenia otra entrada: salir desde el menu de la mascota es una **salida limpia** (code 0) que el plugin, a proposito, no reinicia. Antes eso dejaba la mascota inalcanzable hasta reiniciar toda la aplicacion. Por eso hay un plano de control fuera del proceso de la ventana: el plugin de Host registra una ruta JSON (`/dsh-desktop-pet`) en el servidor web, y `show` o `toggle` **arrancan la ventana cuando no hay ninguna**.
+
 ## Using it
 
 | Gesto | Resultado |
@@ -32,6 +34,8 @@ Ese proceso tiene **dos ventanas y solo una visible a la vez**: la mascota, y el
 | Clic derecho | Menu: abrir Harness, refrescar, **tamano** (75% / 100% / 125% / 150%), ocultar, mover a la esquina, salir |
 | Clic en el medallon | La mascota vuelve y el medallon desaparece |
 | Arrastrar el medallon | Lo mueve; la posicion tambien se recuerda |
+| Boton redondo junto al cuadro de texto | La cara de la mascota: mostrar / ocultar, y arrancarla si no esta corriendo |
+| Ajustes → 桌宠 | Panel completo: estado, pid, mostrar / ocultar / reiniciar / salir, y tamano |
 
 El tamano es un escalado de toda la ventana (`setZoomFactor`), anclado en el centro inferior para que los pies no salten. El estado vive en `<DSH home>/desktop/pet-window.json`.
 
@@ -39,10 +43,10 @@ El tamano es un escalado de toda la ventana (`setZoomFactor`), anclado en el cen
 
 ```sh
 pnpm pack
-dsh plugin --profile desktop add ./dsh-desktop-pet-0.2.0.tgz
+dsh plugin --profile desktop add ./dsh-desktop-pet-0.3.0.tgz
 ```
 
-Instalar desde una **ruta de directorio** no registra el bundle: debe ser un tarball (o npm/git). Reinicia la aplicacion despues; los bundles se cargan al arrancar. El anfitrion de la ventana es `electron`, instalado como dependencia normal, y la puerta de compilacion de pnpm debe permitirlo en `pnpm-workspace.yaml` (`allowBuilds: electron: true`).
+Instalar desde una **ruta de directorio** no registra el bundle: debe ser un tarball (o npm/git). Reinicia la aplicacion despues; tanto el bundle como el modulo `dsh.client` se cargan al arrancar. El anfitrion de la ventana es `electron`, instalado como dependencia normal, y la puerta de compilacion de pnpm debe permitirlo en `pnpm-workspace.yaml` (`allowBuilds: electron: true`).
 
 pnpm **no** reinstala un tarball cuya version no cambia aunque su contenido cambie: usa la integridad del lockfile. Para recoger codigo nuevo, quita el plugin y vuelve a anadirlo.
 
@@ -57,8 +61,9 @@ pnpm **no** reinstala un tarball cuya version no cambia aunque su contenido camb
 | `restartDelayMs` | number | `2000` | Retardo antes de reiniciar tras una salida anormal |
 | `maxRestarts` | number | `5` | Reinicios consecutivos permitidos |
 | `scale` | number | `1` | Tamano **inicial** de la mascota, 0.5–2 |
+| `controlPanel` | boolean | `true` | Registrar la ruta de control `/dsh-desktop-pet` en el servidor web |
 
-La configuracion la valida el esquema Schemastery; ningun valor ajustable esta fijado en el codigo. Una salida limpia (`code 0`) se considera un cierre deliberado y nunca se reinicia.
+La configuracion la valida el esquema Schemastery; ningun valor ajustable esta fijado en el codigo. Una salida limpia (`code 0`) se considera un cierre deliberado y **no** se reinicia sola; el boton 「显示桌宠」 de la pagina es el camino de vuelta.
 
 El proceso escucha ademas en `127.0.0.1:52118` (`status`, `show`, `hide`, `toggle`, `snap`, `scale:<n>`, `quit`), lo que a la vez sirve de cerrojo de instancia unica.
 

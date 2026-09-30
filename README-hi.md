@@ -22,6 +22,8 @@ Window apna data khud padhti hai: token usage engine ki `tokenUsage` projection 
 
 Us process ke paas **do windows hain, ek samay me sirf ek dikhti hai**: mascot, aur chhupne par uski jagah lene wala medallion. Medallion sirf saja nahi hai — desktop shell me mascot ko dobara dikhane ka koi switch nahi hai, isliye chhupana ek one-way door tha. Medallion usi ko band karta hai aur saath hi context pressure ring aur balance dikhata hai.
 
+Usi jaal ka doosra darwaza: mascot ke menu se 「退出桌宠」 ek **clean exit** (code 0) hai jise plugin jaan-boojh kar restart nahi karta. Pehle iska matlab tha ki poori app restart karne tak mascot wapas nahi aata tha. Isliye window process ke bahar ek control plane hai: Host plugin web server par `/dsh-desktop-pet` JSON route register karta hai, aur `show` ya `toggle` **koi window na ho to nayi khada kar deta hai**.
+
 ## Using it
 
 | Gesture | Result |
@@ -32,6 +34,8 @@ Us process ke paas **do windows hain, ek samay me sirf ek dikhti hai**: mascot, 
 | Right-click | Menu: Harness kholein, refresh, **size** (75% / 100% / 125% / 150%), chhupayein, corner me le jayein, band karein |
 | Medallion par click | Mascot wapas, medallion gayab |
 | Medallion drag | Uska position bhi yaad rehta hai |
+| Input box ke paas wala gol button | Mascot ka chehra: dikhayein / chhupayein, aur band ho to shuru karein |
+| Settings → 桌宠 | Poora panel: state, pid, dikhayein / chhupayein / restart / band, aur size |
 
 Size poore window ka scale hai (`setZoomFactor`), neeche-ke-chaukath par anchored. State `<DSH home>/desktop/pet-window.json` me rehti hai.
 
@@ -39,10 +43,10 @@ Size poore window ka scale hai (`setZoomFactor`), neeche-ke-chaukath par anchore
 
 ```sh
 pnpm pack
-dsh plugin --profile desktop add ./dsh-desktop-pet-0.2.0.tgz
+dsh plugin --profile desktop add ./dsh-desktop-pet-0.3.0.tgz
 ```
 
-**Directory path** se install karne par bundle register nahi hota — tarball (ya npm/git) chahiye. Uske baad app restart karein; bundle startup par load hote hain. Window host `electron` hai, normal dependency ke roop me, aur pnpm ka build gate ise `pnpm-workspace.yaml` me allow karna hoga (`allowBuilds: electron: true`).
+**Directory path** se install karne par bundle register nahi hota — tarball (ya npm/git) chahiye. Uske baad app restart karein; bundle aur `dsh.client` module dono startup par load hote hain. Window host `electron` hai, normal dependency ke roop me, aur pnpm ka build gate ise `pnpm-workspace.yaml` me allow karna hoga (`allowBuilds: electron: true`).
 
 pnpm ek hi version ke tarball ko dobara install **nahi** karta, chahe uska content badal gaya ho — lockfile ki integrity hi maayne rakhti hai. Nayi code ke liye plugin ko pehle remove karein, phir add.
 
@@ -57,8 +61,9 @@ pnpm ek hi version ke tarball ko dobara install **nahi** karta, chahe uska conte
 | `restartDelayMs` | number | `2000` | Abnormal exit ke baad restart se pehle deri |
 | `maxRestarts` | number | `5` | Lagataar restart ki seema |
 | `scale` | number | `1` | Mascot ka **shuruaati** size, 0.5–2 |
+| `controlPanel` | boolean | `true` | Web server par `/dsh-desktop-pet` control route register karein |
 
-Config Schemastery schema se validate hoti hai; koi tunable hardcoded nahi hai. Clean exit (`code 0`) ko user ka jaan-boojh kar band karna maana jata hai aur use restart nahi kiya jata.
+Config Schemastery schema se validate hoti hai; koi tunable hardcoded nahi hai. Clean exit (`code 0`) ko user ka jaan-boojh kar band karna maana jata hai aur use apne aap restart **nahi** kiya jata; page ka 「显示桌宠」 button wapas laane ka raasta hai.
 
 Process `127.0.0.1:52118` par bhi sunta hai (`status`, `show`, `hide`, `toggle`, `snap`, `scale:<n>`, `quit`), jo single-instance lock ka bhi kaam karta hai.
 

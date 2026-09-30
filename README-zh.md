@@ -1,6 +1,6 @@
 # dsh-desktop-pet
 
-DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 token 用量与账户余额。隐藏后由一枚小圆钮代替它待在桌面上——圆钮既是唤回的按钮，也是上下文占用与余额的常驻读数。
+DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 token 用量与账户余额。隐藏后由一枚小圆钮代替它待在桌面上——圆钮既是唤回的按钮，也是上下文占用与余额的常驻读数。harness 页面里还有一组控制按钮，桌宠被退出后从那里就能重新拉起来。
 
 [English](README.md) · [Español](README-es.md) · [हिन्दी](README-hi.md) · [Português](README-pt.md)
 
@@ -27,6 +27,14 @@ DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 to
 
 圆钮是必需的，不是装饰：桌面端自身**没有**「显示桌宠」开关，所以隐藏曾经是一扇单向门——`visible: false` 会被记住，而没有任何东西能把它改回来。圆钮补上了这个缺口，顺便把两个最该盯着看的数字顶在脸上：**上下文占用百分比**（脸外那圈进度环，同时以数字显示）和**账户余额**。
 
+同一个坑还有第二个入口：桌宠右键菜单里的「退出桌宠」是**正常退出**（exit code 0），插件刻意不重启它——那是在说「我不玩了」。以前这意味着在重启整个桌面端之前，桌宠再也回不来了。所以浮窗进程之外还有一层控制面：
+
+```
+harness 页面 ──HTTP──> Host 插件 ──TCP 127.0.0.1:52118──> 浮窗进程
+```
+
+Host 插件在 Web 服务上注册一条 JSON 路由 `/dsh-desktop-pet`（`action` 查询参数：`status` / `show` / `hide` / `toggle` / `scale` / `start` / `stop` / `restart` / `icon`）。**`show` 和 `toggle` 会在浮窗没运行时把它拉起来**，所以「退出桌宠」不再是终点。
+
 浮窗自己读数据，不向 harness 要任何东西：
 
 | 显示 | 来源 |
@@ -51,7 +59,16 @@ DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 to
 
 圆钮第一次出现时会顶着一个小气泡说「点我唤回桌宠」，五秒后自己消失——那是它唯一一次自我介绍。
 
-桌宠大小是**整窗等比缩放**（用 `setZoomFactor`，所以文字、描边、命中区域一起缩放，布局不会错位），并以底边中点为锚点，脚不会跳。缩放是在菜单里即时生效并记住的；插件配置里的 `scale` 只是首次启动的初值。
+**页面里的控制**（`dsh.client` 模块，见 `client.js`）：
+
+| 位置 | 是什么 |
+|---|---|
+| 输入框左侧的小圆钮 | 桌宠的脸。单击 = 显示 / 隐藏；桌宠被退出时单击 = 把它重新拉起来。运行中脸上带个绿点，未运行则变淡 |
+| 设置页 → 桌宠 | 完整面板：运行状态与 pid、显示 / 隐藏 / 重新启动进程 / 退出进程、大小 75% / 100% / 125% / 150% |
+
+两个入口都走上面那条 HTTP 路由，所以它们看到的状态和浮窗本身永远是同一个。
+
+桌宠大小是**整窗等比缩放**（用 `setZoomFactor`，所以文字、描边、命中区域一起缩放，布局不会错位），并以底边中点为锚点，脚不会跳。缩放是在菜单、页面面板里即时生效并记住的；插件配置里的 `scale` 只是首次启动的初值。
 
 设置保存在 `<DSH 主目录>/desktop/pet-window.json`：位置、可见性、缩放比例和圆钮的位置。
 
@@ -59,10 +76,10 @@ DeepSeek Harness 的桌面桌宠：一个置顶浮窗，工作时实时显示 to
 
 ```sh
 pnpm pack
-dsh plugin --profile desktop add ./dsh-desktop-pet-0.2.0.tgz
+dsh plugin --profile desktop add ./dsh-desktop-pet-0.3.0.tgz
 ```
 
-⚠️ 用**目录路径**安装不会注册 bundle——必须是 tarball（或 npm / git 源）。装完要重启桌面端，bundle 插件在启动时加载。
+⚠️ 用**目录路径**安装不会注册 bundle——必须是 tarball（或 npm / git 源）。装完要重启桌面端：bundle 插件和 `dsh.client` 客户端模块都在启动时扫描并加载。
 
 同名版本的 tarball 内容变了 pnpm **不会**重装（`file:` 依赖按锁文件里的 integrity 判定为「已是最新」）。改了代码要重装的话，先 `dsh plugin --profile desktop remove dsh-desktop-pet` 再 `add`。
 
@@ -85,13 +102,14 @@ allowBuilds:
 | `cwd` | string | `''` | 浮窗进程的工作目录。留空用 `<DSH 主目录>/desktop-pet`——**刻意不取用户主目录**（那里的 `NTUSER.DAT` 锁会让文件监视器挂掉），也不放插件包内（运行中的浮窗会锁住包目录，导致 `ERR_PNPM_EPERM` 让插件永远无法更新） |
 | `restartDelayMs` | number | `2000` | 异常退出后重新拉起的延迟。`0` 表示不再重启 |
 | `maxRestarts` | number | `5` | 连续重启次数上限，超过后停止并记录一次错误 |
-| `scale` | number | `1` | 桌宠**初始**缩放比例，0.5–2（常用 `0.75` / `1` / `1.25` / `1.5`）。之后在菜单里改的值会记住并覆盖它 |
+| `scale` | number | `1` | 桌宠**初始**缩放比例，0.5–2（常用 `0.75` / `1` / `1.25` / `1.5`）。之后在菜单或页面面板里改的值会记住并覆盖它 |
+| `controlPanel` | boolean | `true` | 是否注册页面控制接口 `/dsh-desktop-pet`。关掉后浮窗照常工作，只是页面里没有控制按钮 |
 
 配置由 `lib/index.js` 的 Schemastery `Config` schema 校验；没有硬编码的可调项。非法值在加载期响亮失败，而不是静默取默认值。
 
-正常退出（`code 0`）被视为用户主动关闭桌宠，**永不重启**；只有异常退出才计入 `maxRestarts`。
+正常退出（`code 0`）被视为用户主动关闭桌宠，**不会被自动重启**；只有异常退出才计入 `maxRestarts`。页面上的「显示桌宠」是它回来的路——那是一次显式启动，会清零重启计数。
 
-浮窗进程还在 `127.0.0.1:52118` 上开了一个控制端口（`status` / `show` / `hide` / `toggle` / `snap` / `scale:<比例>` / `quit`），一行一条命令。它顺便充当单实例锁——桌宠在每次桌面端启动时都会被拉起，没有锁就会越堆越多。
+浮窗进程还在 `127.0.0.1:52118` 上开了一个控制端口（`status` / `show` / `hide` / `toggle` / `snap` / `scale:<比例>` / `quit`），一行一条命令。它顺便充当单实例锁——桌宠在每次桌面端启动时都会被拉起，没有锁就会越堆越多。Host 插件是它唯一的客户端。
 
 ## Development
 
@@ -100,7 +118,9 @@ npm install --ignore-scripts   # 迭代时跳过 electron 二进制的大下载
 npm test
 ```
 
-`tests/lifecycle.test.js` 用桩上下文驱动真实插件：断言 effect 被注册（disabled 时不注册）、激活会拉起子进程而 dispose 会杀掉它、崩溃会重启而正常退出不会、运行时缺失会被记录而不是吞掉。
+`tests/lifecycle.test.js` 用桩上下文驱动真实插件：断言 effect 被注册（disabled 时不注册）、激活会拉起子进程而 dispose 会杀掉它、崩溃会重启而正常退出不会、运行时缺失会被记录而不是吞掉、控制路由挂在 Web 服务上并且缺席时插件照常工作。
+
+`client.js` 是**单文件自包含**的客户端 bundle（页面里只允许 `require('react')`，入口是 `window.__ModuleLoader__.load({ id, factory })`，`id` 必须等于包名），没有构建步骤：改完 `pnpm pack` 重装即可。
 
 ## License
 
